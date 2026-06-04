@@ -1,29 +1,36 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { TableRowSkeleton } from '@/components/SkeletonCards';
+import { getCached, setCache } from '@/lib/cache';
 import { Trash2, Plus } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { cn } from '@/lib/utils';
+
+const CACHE_KEY = 'staff';
 
 export default function StaffPanel() {
   const [staff, setStaff] = useState<any[]>([]);
   const [newStaff, setNewStaff] = useState({ name: '', role: 'waiter', pin_code: '' });
   const [loading, setLoading] = useState(true);
 
+  const loadStaff = () => { fetch('/api/staff?all=true').then((r) => r.json()).then((d) => { setStaff(d); setLoading(false); setCache(CACHE_KEY, d); }); };
+
   useEffect(() => {
+    const cached = getCached<any[]>(CACHE_KEY);
+    if (cached) { setStaff(cached); setLoading(false); return; }
     loadStaff();
-    const s: Socket = io();
-    s.emit('join-role', 'admin');
-    s.on('staff-changed', () => { loadStaff(); });
-    return () => { s.disconnect(); };
+    const channel = supabase
+      .channel('admin-staff')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'staff' }, () => { loadStaff(); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
   }, []);
-  const loadStaff = () => { fetch('/api/staff?all=true').then((r) => r.json()).then((d) => { setStaff(d); setLoading(false); }); };
 
   const add = async () => {
     if (!newStaff.name || !newStaff.pin_code) return;

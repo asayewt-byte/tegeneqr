@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { io, Socket } from 'socket.io-client';
+import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -13,6 +13,12 @@ import { StatusBadge } from '@/components/StatusBadge';
 import { OrderCardSkeleton } from '@/components/SkeletonCards';
 import { LogOut, Clock, TrendingUp, AlertTriangle, CheckCircle2, Users, Bell, ChefHat } from 'lucide-react';
 import toast from 'react-hot-toast';
+
+function parseItems(items: any): any[] {
+  if (!items) return [];
+  if (Array.isArray(items)) return items;
+  try { return JSON.parse(items); } catch { return []; }
+}
 
 interface Staff { id: number; name: string; role: string; }
 interface Order {
@@ -26,6 +32,21 @@ export default function CashierPage() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [cashier, setCashier] = useState<Staff | null>(null);
   const [pin, setPin] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    const saved = localStorage.getItem('cashier_session');
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        setCashier(data);
+        setLoggedIn(true);
+      } catch { localStorage.removeItem('cashier_session'); }
+    }
+    setHydrated(true);
+  }, []);
   const [orders, setOrders] = useState<Order[]>([]);
   const [waiters, setWaiters] = useState<Staff[]>([]);
   const [filter, setFilter] = useState('pending');
@@ -55,19 +76,13 @@ export default function CashierPage() {
     fetch('/api/staff?role=waiter').then((r) => r.json()).then(setWaiters);
   }, []);
 
+  const refreshOrders = () => {
+    fetch('/api/orders').then((r) => r.json()).then(setOrders);
+  };
+
   useEffect(() => {
     if (!loggedIn || !cashier) return;
     setLoading(true);
-    const s: Socket = io();
-    s.emit('join-role', 'cashier');
-    s.on('new-order', (order: Order) => {
-      refreshOrders();
-      playNotification();
-      toast.success(`New order from Table ${order.table_number}!`, { icon: '🔔' });
-    });
-    s.on('order-updated', (updated: Order) => {
-      refreshOrders();
-    });
     Promise.all([
       fetch('/api/orders').then((r) => r.json()),
       fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cashier_id: cashier.id, starting_cash: 0 }) }).then((r) => r.ok ? r.json() : null),
@@ -76,65 +91,147 @@ export default function CashierPage() {
       if (session) setSessionId(session.id);
       setLoading(false);
     });
-    return () => { s.disconnect(); };
+
+    const channel = supabase
+      .channel('cashier-orders')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, (payload) => {
+        refreshOrders();
+        playNotification();
+        toast.success(`New order from Table ${payload.new.table_id}!`, { icon: '🔔' });
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, () => {
+        refreshOrders();
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, [loggedIn, cashier]);
 
   const handleLogin = async () => {
+    if (loggingIn) return;
+    setLoggingIn(true);
     const res = await fetch('/api/staff/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin_code: pin, role: 'cashier' }) });
-    if (res.ok) { const data = await res.json(); setCashier(data); setLoggedIn(true); toast.success(`Welcome, ${data.name}!`); }
+    setLoggingIn(false);
+    if (res.ok) { const data = await res.json(); setCashier(data); setLoggedIn(true); localStorage.setItem('cashier_session', JSON.stringify(data)); toast.success(`Welcome, ${data.name}!`); }
     else { toast.error('Invalid PIN'); }
   };
 
   const handleLogout = async () => {
+    await fetch('/api/staff/logout', { method: 'POST' }).catch(() => {});
     if (sessionId) await fetch('/api/sessions', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: sessionId, ending_cash: 0 }) }).catch(() => {});
     setLoggedIn(false); setCashier(null); setSessionId(null); setPin(''); setOrders([]);
+    localStorage.removeItem('cashier_session');
     toast.success('Logged out');
   };
 
-  const refreshOrders = () => {
-    fetch('/api/orders').then((r) => r.json()).then(setOrders);
-  };
-
   const handleApprove = async (orderId: number) => {
+    if (submitting) return;
+    setSubmitting(true);
     await fetch('/api/cashier', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_id: orderId, action: 'approve', cashier_id: cashier?.id }) });
+    setSubmitting(false);
     toast.success('Order confirmed');
   };
 
   const handleAssign = async (orderId: number, waiterId: number) => {
+    if (submitting) return;
+    setSubmitting(true);
     await fetch('/api/cashier', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_id: orderId, action: 'assign', waiter_id: waiterId }) });
+    setSubmitting(false);
     toast.success('Waiter assigned');
   };
 
   const handleCancel = async () => {
-    if (!showCancelModal || !selectedReason) return;
+    if (!showCancelModal || !selectedReason || submitting) return;
+    setSubmitting(true);
     await fetch('/api/cashier', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_id: showCancelModal, action: 'cancel', cashier_id: cashier?.id, cancellation_reason: selectedReason }) });
+    setSubmitting(false);
     setShowCancelModal(null); setSelectedReason('');
     toast.success('Order cancelled');
   };
 
   const handleStatusUpdate = async (orderId: number, status: string) => {
+    if (submitting) return;
+    setSubmitting(true);
     await fetch(`/api/orders/${orderId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status, cashier_id: cashier?.id }) });
+    setSubmitting(false);
     toast.success(`Order ${status}`);
   };
 
+  if (!hydrated) return null;
   if (!loggedIn) return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100 p-4">
-      <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
-        className="bg-white/80 backdrop-blur-lg p-8 rounded-3xl shadow-2xl max-w-sm w-full border border-white/60">
-        <div className="text-center mb-8">
-          <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.1 }}
-            className="w-16 h-16 mx-auto mb-4 bg-gradient-to-br from-amber-400 to-orange-500 rounded-2xl flex items-center justify-center shadow-lg shadow-amber-500/30">
-            <CheckCircle2 className="h-8 w-8 text-white" />
-          </motion.div>
-          <h1 className="text-2xl font-bold text-gray-900">Cashier Login</h1>
-          <p className="text-gray-400 text-sm mt-1">Enter your PIN to start your shift</p>
+    <div className="relative min-h-screen flex flex-col overflow-hidden bg-gray-950">
+      {/* Full background photo */}
+      <div className="absolute inset-0">
+        <div className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+          style={{ backgroundImage: "url('https://images.unsplash.com/photo-1559339352-11d035aa65de?w=1400&q=85')" }}>
+          <div className="absolute inset-0 bg-gradient-to-b from-gray-950/40 via-gray-950/20 to-gray-950" />
+          <div className="absolute inset-0 bg-gradient-to-r from-amber-900/20 to-transparent" />
         </div>
-        <Input type="password" placeholder="• • • •" value={pin} onChange={(e) => setPin(e.target.value)}
-          className="text-center text-2xl tracking-[0.5em] h-14 mb-4 rounded-xl" maxLength={4} autoFocus />
-        <Button onClick={handleLogin} className="w-full h-12 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-xl shadow-lg shadow-amber-500/30">
-          Start Shift
-        </Button>
-      </motion.div>
+      </div>
+
+      {/* Decorative glow */}
+      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[500px] h-[500px] bg-amber-500/10 rounded-full blur-[120px]" />
+
+      {/* Top brand — subtle */}
+      <div className="relative z-10 p-6 lg:p-10">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 bg-gradient-to-br from-amber-400 to-orange-500 rounded-xl flex items-center justify-center shadow-lg shadow-amber-500/20">
+            <svg className="h-4.5 w-4.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
+            </svg>
+          </div>
+          <span className="text-white/70 text-sm font-semibold tracking-widest uppercase">Buna BeNet</span>
+        </div>
+      </div>
+
+      {/* Login card — bottom-elevated on mobile, centered on desktop */}
+      <div className="relative z-10 flex-1 flex items-end lg:items-center justify-center px-4 pb-8 lg:pb-0">
+        <motion.div initial={{ opacity: 0, y: 40 }} animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-sm">
+          <div className="bg-white/[0.06] backdrop-blur-2xl rounded-[2rem] p-7 pb-8 border border-white/[0.08] shadow-2xl">
+            {/* Avatar + greeting */}
+            <div className="text-center mb-6">
+              <div className="w-16 h-16 mx-auto mb-4 bg-gradient-to-br from-amber-400 to-orange-500 rounded-2xl flex items-center justify-center shadow-xl shadow-amber-500/20 ring-1 ring-white/10">
+                <svg className="h-7 w-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
+                </svg>
+              </div>
+              <h2 className="text-2xl font-bold text-white">Welcome, Team</h2>
+              <p className="text-white/40 text-sm mt-1">Enter your PIN to start your shift</p>
+            </div>
+
+            <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); handleLogin(); }}>
+              <div className="relative">
+                <div className="absolute left-4 top-1/2 -translate-y-1/2 text-white/30">
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
+                  </svg>
+                </div>
+                <input type="password" placeholder="PIN Code" value={pin} onChange={(e) => setPin(e.target.value)}
+                  className="w-full pl-11 pr-4 py-3.5 bg-white/5 border border-white/10 text-white placeholder:text-white/25 rounded-2xl text-base font-mono tracking-widest outline-none focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/15 transition-all" maxLength={4} autoFocus />
+              </div>
+              <Button type="submit" disabled={loggingIn}
+                className="w-full py-3.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-white font-semibold rounded-2xl shadow-xl shadow-amber-500/25 text-base transition-all hover:shadow-2xl hover:shadow-amber-500/30 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-xl">
+                {loggingIn ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                    Signing in...
+                  </span>
+                ) : (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                    </svg>
+                    Start Shift
+                  </span>
+                )}
+              </Button>
+            </form>
+
+            <p className="text-white/20 text-xs text-center mt-6 tracking-wide">Hotel Staff Portal</p>
+          </div>
+        </motion.div>
+      </div>
     </div>
   );
 
@@ -153,19 +250,21 @@ export default function CashierPage() {
   };
 
   const tabs = [
-    { key: 'pending', label: 'Pending', short: 'Pend' },
-    { key: 'active', label: 'Active', short: 'Active' },
-    { key: 'cancelled', label: 'Cancelled', short: 'Canc' },
-    { key: 'paid', label: 'Paid', short: 'Paid' },
-    { key: 'all', label: 'All', short: 'All' },
+    { key: 'pending', label: 'Pending', color: 'text-amber-300', bg: 'bg-amber-500/15', dot: 'bg-amber-400' },
+    { key: 'active', label: 'Active', color: 'text-blue-300', bg: 'bg-blue-500/15', dot: 'bg-blue-400' },
+    { key: 'cancelled', label: 'Cancelled', color: 'text-red-300', bg: 'bg-red-500/15', dot: 'bg-red-400' },
+    { key: 'paid', label: 'Paid', color: 'text-emerald-300', bg: 'bg-emerald-500/15', dot: 'bg-emerald-400' },
+    { key: 'all', label: 'All', color: 'text-white', bg: 'bg-white/10', dot: '' },
   ];
+  const tabCounts: Record<string, number> = {
+    pending: stats.pending, active: stats.active, cancelled: orders.filter(o => o.status === 'cancelled').length,
+    paid: orders.filter(o => o.status === 'paid').length, all: orders.length,
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
       <div className="bg-gradient-to-r from-gray-900 to-gray-800 text-white sticky top-0 z-10">
         <div className="px-3 sm:px-4 py-3">
-          {/* Top row: name + logout */}
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2 sm:gap-3">
               <h1 className="text-base sm:text-lg font-bold">{cashier?.name}</h1>
@@ -175,41 +274,48 @@ export default function CashierPage() {
               <LogOut className="h-4 w-4 sm:mr-1" /><span className="hidden sm:inline">Logout</span>
             </Button>
           </div>
-
-          {/* Stats */}
           <div className="grid grid-cols-4 gap-2 sm:gap-3 mb-3">
             {[
-              { label: 'Pending', value: stats.pending, icon: Clock, color: 'text-amber-400' },
-              { label: 'Active', value: stats.active, icon: ChefHat, color: 'text-blue-400' },
-              { label: 'Today', value: stats.today, icon: TrendingUp, color: 'text-emerald-400' },
-              { label: 'Revenue', value: stats.revenue, icon: TrendingUp, color: 'text-orange-400', prefix: 'ETB ' },
+              { label: 'Pending', value: stats.pending, icon: Clock, accent: 'amber', gradient: 'from-amber-400/20 to-amber-500/5', iconBg: 'bg-amber-500/20', iconColor: 'text-amber-300' },
+              { label: 'Active', value: stats.active, icon: ChefHat, accent: 'blue', gradient: 'from-blue-400/20 to-blue-500/5', iconBg: 'bg-blue-500/20', iconColor: 'text-blue-300' },
+              { label: 'Today', value: stats.today, icon: TrendingUp, accent: 'emerald', gradient: 'from-emerald-400/20 to-emerald-500/5', iconBg: 'bg-emerald-500/20', iconColor: 'text-emerald-300' },
+              { label: 'Revenue', value: stats.revenue, icon: TrendingUp, accent: 'orange', gradient: 'from-orange-400/20 to-orange-500/5', iconBg: 'bg-orange-500/20', iconColor: 'text-orange-300', prefix: 'ETB ' },
             ].map((s) => (
-              <div key={s.label} className="bg-white/10 rounded-xl p-2 sm:p-3">
-                <div className="flex items-center gap-1 sm:gap-2 mb-0.5 sm:mb-1">
-                  <s.icon className={`h-3 w-3 sm:h-3.5 sm:w-3.5 ${s.color}`} />
-                  <span className="text-[9px] sm:text-[10px] text-gray-400 uppercase tracking-wider">{s.label}</span>
+              <div key={s.label} className="relative rounded-xl p-2.5 sm:p-3 border border-white/[0.06] overflow-hidden">
+                <div className={`absolute inset-0 bg-gradient-to-br ${s.gradient}`} />
+                <div className="relative z-10">
+                  <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+                    <span className="text-[9px] sm:text-[10px] text-white/50 uppercase tracking-[0.12em] font-semibold">{s.label}</span>
+                    <div className={`${s.iconBg} p-1.5 rounded-lg ring-1 ring-white/10`}>
+                      <s.icon className={`h-2.5 w-2.5 sm:h-3 sm:w-3 ${s.iconColor}`} />
+                    </div>
+                  </div>
+                  <AnimatedCounter value={s.value} prefix={s.prefix || ''}
+                    className={`text-lg sm:text-2xl font-bold tracking-tight text-white drop-shadow-sm`} />
                 </div>
-                <AnimatedCounter value={s.value} prefix={s.prefix || ''} className={`text-base sm:text-xl font-bold ${s.color}`} />
               </div>
             ))}
           </div>
-
-          {/* Filter Tabs — scrollable, compact on mobile */}
-          <div className="flex gap-1 sm:gap-1.5 overflow-x-auto scrollbar-hide -mx-3 px-3 pb-1">
+          <div className="flex gap-1.5 overflow-x-auto scrollbar-hide -mx-3 px-3 pb-1">
             {tabs.map((t) => (
               <button key={t.key} onClick={() => setFilter(t.key)}
-                className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-[11px] sm:text-xs font-medium whitespace-nowrap transition-all ${
-                  filter === t.key ? 'bg-white text-gray-900 shadow' : 'text-gray-400 hover:text-white hover:bg-white/10'
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium whitespace-nowrap transition-all ${
+                  filter === t.key
+                    ? `${t.bg} ${t.color} shadow-sm`
+                    : 'text-white/40 hover:text-white/70 hover:bg-white/[0.06]'
                 }`}>
-                <span className="sm:hidden">{t.short}</span>
-                <span className="hidden sm:inline">{t.label}</span>
+                {t.dot && <span className={`w-1.5 h-1.5 rounded-full ${t.dot}`} />}
+                <span>{t.label}</span>
+                <span className={`ml-0.5 text-[10px] font-semibold tabular-nums ${
+                  filter === t.key ? 'opacity-70' : 'opacity-40'
+                }`}>
+                  {tabCounts[t.key]}
+                </span>
               </button>
             ))}
           </div>
         </div>
       </div>
-
-      {/* Orders Grid */}
       <div className="max-w-7xl mx-auto p-4">
         {loading ? (
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -225,7 +331,7 @@ export default function CashierPage() {
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             <AnimatePresence mode="popLayout">
               {filteredOrders.map((order) => {
-                const items = JSON.parse(order.items || '[]');
+                const items = parseItems(order.items);
                 const timeSince = Math.floor((Date.now() - new Date(order.created_at).getTime()) / 60000);
                 return (
                   <motion.div key={order.id}
@@ -254,11 +360,9 @@ export default function CashierPage() {
                         </div>
                         <StatusBadge status={order.status} />
                       </div>
-
                       <div className="text-xs text-gray-400 mb-3">
                         {new Date(order.created_at).toLocaleTimeString()}
                       </div>
-
                       <div className="border-t pt-3 mb-3 space-y-1.5">
                         {items.map((item: any, idx: number) => (
                           <div key={idx} className="flex justify-between text-sm">
@@ -271,19 +375,16 @@ export default function CashierPage() {
                           <span className="text-amber-600">ETB {order.final_amount.toLocaleString()}</span>
                         </div>
                       </div>
-
                       {order.notes && (
                         <div className="bg-amber-50 border border-amber-100 p-2.5 rounded-xl mb-3 text-sm text-amber-800">
                           📝 {order.notes}
                         </div>
                       )}
-
-                      {/* Actions */}
                       <div className="space-y-2">
                         {order.status === 'pending' && (
                           <div className="flex gap-2">
-                            <Button onClick={() => handleApprove(order.id)} size="sm"
-                              className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl">
+                            <Button onClick={() => handleApprove(order.id)} size="sm" disabled={submitting}
+                              className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl disabled:opacity-50">
                               <CheckCircle2 className="h-3.5 w-3.5 mr-1" /> Confirm
                             </Button>
                             <Button onClick={() => setShowCancelModal(order.id)} size="sm" variant="destructive" className="rounded-xl">
@@ -302,7 +403,7 @@ export default function CashierPage() {
                                   {waiters.map((w) => <SelectItem key={w.id} value={String(w.id)}>{w.name}</SelectItem>)}
                                 </SelectContent>
                               </Select>
-                              <Button onClick={() => handleStatusUpdate(order.id, 'preparing')} size="sm" className="bg-orange-500 hover:bg-orange-600 text-white rounded-xl px-3">
+                              <Button onClick={() => handleStatusUpdate(order.id, 'preparing')} size="sm" disabled={submitting} className="bg-orange-500 hover:bg-orange-600 text-white rounded-xl px-3 disabled:opacity-50">
                                 Preparing
                               </Button>
                             </div>
@@ -313,16 +414,15 @@ export default function CashierPage() {
                         )}
                         {['preparing', 'ready', 'served'].includes(order.status) && (
                           <div className="flex gap-2">
-                            {order.status === 'preparing' && <Button onClick={() => handleStatusUpdate(order.id, 'ready')} size="sm" className="flex-1 bg-violet-500 hover:bg-violet-600 text-white rounded-xl">Ready</Button>}
-                            {order.status === 'ready' && <Button onClick={() => handleStatusUpdate(order.id, 'served')} size="sm" className="flex-1 bg-blue-500 hover:bg-blue-600 text-white rounded-xl">Served</Button>}
-                            {order.status === 'served' && <Button onClick={() => handleStatusUpdate(order.id, 'paid')} size="sm" className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl">Mark Paid</Button>}
+                            {order.status === 'preparing' && <Button onClick={() => handleStatusUpdate(order.id, 'ready')} size="sm" disabled={submitting} className="flex-1 bg-violet-500 hover:bg-violet-600 text-white rounded-xl disabled:opacity-50">Ready</Button>}
+                            {order.status === 'ready' && <Button onClick={() => handleStatusUpdate(order.id, 'served')} size="sm" disabled={submitting} className="flex-1 bg-blue-500 hover:bg-blue-600 text-white rounded-xl disabled:opacity-50">Served</Button>}
+                            {order.status === 'served' && <Button onClick={() => handleStatusUpdate(order.id, 'paid')} size="sm" disabled={submitting} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl disabled:opacity-50">Mark Paid</Button>}
                             <Button onClick={() => setShowCancelModal(order.id)} size="sm" variant="outline" className="rounded-xl text-red-600 border-red-200">
                               <AlertTriangle className="h-3.5 w-3.5" />
                             </Button>
                           </div>
                         )}
                       </div>
-
                       {order.waiter_id && (
                         <div className="mt-2 text-xs text-gray-400 flex items-center gap-1">
                           <Users className="h-3 w-3" /> {waiters.find((w) => w.id === order.waiter_id)?.name || 'Assigned'}
@@ -339,8 +439,6 @@ export default function CashierPage() {
           </div>
         )}
       </div>
-
-      {/* Cancel Modal */}
       <AnimatePresence>
         {showCancelModal && (
           <motion.div className="fixed inset-0 z-50 flex items-center justify-center" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
@@ -355,7 +453,7 @@ export default function CashierPage() {
                 </SelectContent>
               </Select>
               <div className="flex gap-2">
-                <Button onClick={handleCancel} disabled={!selectedReason} variant="destructive" className="flex-1 rounded-xl">Confirm Cancel</Button>
+                <Button onClick={handleCancel} disabled={!selectedReason || submitting} variant="destructive" className="flex-1 rounded-xl">Confirm Cancel</Button>
                 <Button onClick={() => setShowCancelModal(null)} variant="outline" className="flex-1 rounded-xl">Back</Button>
               </div>
             </motion.div>

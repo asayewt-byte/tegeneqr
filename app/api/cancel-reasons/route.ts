@@ -1,8 +1,12 @@
 import { NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { supabaseAdmin } from '@/lib/supabase';
 
 export async function GET() {
-  const db = getDb();
-  const reasons = db.prepare('SELECT * FROM cancellation_reasons ORDER BY category, reason').all();
+  const { data: reasons } = await supabaseAdmin
+    .from('cancellation_reasons')
+    .select('*')
+    .order('category')
+    .order('reason');
+
   return NextResponse.json(reasons);
 }

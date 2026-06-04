@@ -1,8 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  serverExternalPackages: ['@supabase/supabase-js'],
   experimental: {
-    serverComponentsExternalPackages: ['better-sqlite3'],
     optimizePackageImports: ['lucide-react', 'framer-motion', '@radix-ui/react-dialog', '@radix-ui/react-select'],
   },
   images: {

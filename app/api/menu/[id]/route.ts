@@ -1,24 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import { emitMenuChanged } from '@/lib/socket';
+import { supabaseAdmin } from '@/lib/supabase';
 
-export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
-  const id = parseInt(params.id);
+export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
   const body = await request.json();
-  const db = getDb();
-  db.prepare(`
-    UPDATE menu_items SET name=?, price=?, cost=?, category=?, sub_category=?, description=?, image_url=?, is_available=?, is_recommended=?, preparation_time=?
-    WHERE id=?
-  `).run(body.name, body.price, body.cost ?? 0, body.category, body.sub_category || null, body.description || null, body.image_url || null, body.is_available ?? 1, body.is_recommended ?? 0, body.preparation_time || 10, id);
-  const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
-  emitMenuChanged();
+
+  await supabaseAdmin.from('menu_items').update({
+    name: body.name, price: body.price, cost: body.cost ?? 0, category: body.category,
+    sub_category: body.sub_category || null, description: body.description || null,
+    image_url: body.image_url || null, is_available: body.is_available ?? 1,
+    is_recommended: body.is_recommended ?? 0, preparation_time: body.preparation_time || 10,
+  }).eq('id', id);
+
+  const { data: item } = await supabaseAdmin.from('menu_items').select('*').eq('id', id).single();
   return NextResponse.json(item);
 }
 
-export async function DELETE(_request: NextRequest, { params }: { params: { id: string } }) {
-  const id = parseInt(params.id);
-  const db = getDb();
-  db.prepare('DELETE FROM menu_items WHERE id = ?').run(id);
-  emitMenuChanged();
+export async function DELETE(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  await supabaseAdmin.from('menu_items').delete().eq('id', id);
   return NextResponse.json({ success: true });
 }

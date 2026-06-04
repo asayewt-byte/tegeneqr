@@ -1,35 +1,27 @@
-import { NextResponse } from 'next/server';
-import type { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+
+const protectedRoutes = ['/admin', '/cashier'];
 
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const sessionToken = request.cookies.get('qr_session')?.value;
-  const isQRTokenRoute = pathname.startsWith('/a/');
-  const isMenuRoute = pathname.startsWith('/menu/');
-  const isOrderApiPost = pathname === '/api/orders' && request.method === 'POST';
 
-  if (isQRTokenRoute) {
-    return NextResponse.next();
+  const isProtected = protectedRoutes.some((route) => pathname === route || pathname.startsWith(`${route}/`));
+  if (!isProtected) return NextResponse.next();
+
+  const session = request.cookies.get('session')?.value;
+  if (session) {
+    try {
+      const binary = atob(session);
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      const json = new TextDecoder().decode(bytes);
+      const data = JSON.parse(json);
+      if (data.exp > Date.now()) return NextResponse.next();
+    } catch {}
   }
 
-  if (isMenuRoute) {
-    const token = pathname.split('/menu/')[1];
-    if (!token || sessionToken !== token) {
-      return NextResponse.redirect(new URL('/', request.url));
-    }
-    return NextResponse.next();
-  }
-
-  if (isOrderApiPost) {
-    if (!sessionToken) {
-      return NextResponse.json({ error: 'QR session required' }, { status: 401 });
-    }
-    return NextResponse.next();
-  }
-
-  return NextResponse.next();
+  return NextResponse.redirect(new URL('/', request.url));
 }
 
 export const config = {
-  matcher: ['/menu/:path*', '/a/:path*', '/api/orders'],
-}
+  matcher: ['/admin/:path*', '/cashier/:path*'],
+};

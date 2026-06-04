@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import { generateDailySummary, getPopularProducts, getCashierPerformance, getCancellationAnalytics, getHourlyOrderDistribution } from '@/lib/reports';
+import { supabaseAdmin } from '@/lib/supabase';
+import { generateDailySummary, getRecentDailySummaries, getPopularProducts, getCashierPerformance, getCancellationAnalytics, getHourlyOrderDistribution } from '@/lib/reports';
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -10,36 +10,53 @@ export async function GET(request: NextRequest) {
 
   switch (type) {
     case 'daily': {
-      const db = getDb();
-      const summary = date ? generateDailySummary(date) : generateDailySummary();
-      const recent = db.prepare('SELECT * FROM daily_sales_summary ORDER BY date DESC LIMIT 30').all();
+      const summary = date ? await generateDailySummary(date) : await generateDailySummary();
+      const recent = await getRecentDailySummaries(30);
       return NextResponse.json({ summary, recent });
     }
     case 'products':
-      return NextResponse.json(getPopularProducts(20));
+      return NextResponse.json(await getPopularProducts(20));
     case 'cashiers':
-      return NextResponse.json(getCashierPerformance(days));
+      return NextResponse.json(await getCashierPerformance(days));
     case 'cancellations':
-      return NextResponse.json(getCancellationAnalytics(days));
+      return NextResponse.json(await getCancellationAnalytics(days));
     case 'hourly':
-      return NextResponse.json(getHourlyOrderDistribution(days));
+      return NextResponse.json(await getHourlyOrderDistribution(days));
     case 'overview': {
-      const db = getDb();
       const today = date || new Date().toISOString().split('T')[0];
-      const stats = {
-        pending_orders: (db.prepare("SELECT COUNT(*) as c FROM orders WHERE status = 'pending'").get() as any).c,
-        active_orders: (db.prepare("SELECT COUNT(*) as c FROM orders WHERE status NOT IN ('paid', 'cancelled', 'served')").get() as any).c,
-        todays_orders: (db.prepare('SELECT COUNT(*) as c FROM orders WHERE date(created_at) = ?').get(today) as any).c,
-        todays_revenue: (db.prepare("SELECT COALESCE(SUM(final_amount), 0) as s FROM orders WHERE date(created_at) = ? AND status != 'cancelled'").get(today) as any).s,
-        todays_cancellations: (db.prepare("SELECT COUNT(*) as c FROM orders WHERE date(created_at) = ? AND status = 'cancelled'").get(today) as any).c,
-        total_menu_items: (db.prepare('SELECT COUNT(*) as c FROM menu_items').get() as any).c,
-        available_items: (db.prepare('SELECT COUNT(*) as c FROM menu_items WHERE is_available = 1').get() as any).c,
-        active_tables: (db.prepare('SELECT COUNT(*) as c FROM tables WHERE is_active = 1').get() as any).c,
-        active_staff: (db.prepare('SELECT COUNT(*) as c FROM staff WHERE is_active = 1').get() as any).c,
-      };
-      return NextResponse.json(stats);
+      const { count: pendingOrders } = await supabaseAdmin
+        .from('orders').select('*', { count: 'exact', head: true }).eq('status', 'pending');
+      const { count: activeOrders } = await supabaseAdmin
+        .from('orders').select('*', { count: 'exact', head: true }).not('status', 'in', ['paid', 'cancelled', 'served']);
+      const { count: todaysOrders } = await supabaseAdmin
+        .from('orders').select('*', { count: 'exact', head: true }).gte('created_at', `${today} 00:00:00`).lte('created_at', `${today} 23:59:59`);
+      const { count: todaysCancellations } = await supabaseAdmin
+        .from('orders').select('*', { count: 'exact', head: true }).eq('status', 'cancelled').gte('created_at', `${today} 00:00:00`).lte('created_at', `${today} 23:59:59`);
+      const { data: todaysRevenueData } = await supabaseAdmin
+        .from('orders').select('final_amount').gte('created_at', `${today} 00:00:00`).lte('created_at', `${today} 23:59:59`).neq('status', 'cancelled');
+      const todaysRevenue = (todaysRevenueData || []).reduce((s, o) => s + (o.final_amount || 0), 0);
+      const { count: totalMenuItems } = await supabaseAdmin
+        .from('menu_items').select('*', { count: 'exact', head: true });
+      const { count: availableItems } = await supabaseAdmin
+        .from('menu_items').select('*', { count: 'exact', head: true }).eq('is_available', 1);
+      const { count: activeTables } = await supabaseAdmin
+        .from('tables').select('*', { count: 'exact', head: true }).eq('is_active', 1);
+      const { count: activeStaff } = await supabaseAdmin
+        .from('staff').select('*', { count: 'exact', head: true }).eq('is_active', 1);
+
+      return NextResponse.json({
+        pending_orders: pendingOrders || 0,
+        active_orders: activeOrders || 0,
+        todays_orders: todaysOrders || 0,
+        todays_revenue: todaysRevenue,
+        todays_cancellations: todaysCancellations || 0,
+        total_menu_items: totalMenuItems || 0,
+        available_items: availableItems || 0,
+        active_tables: activeTables || 0,
+        active_staff: activeStaff || 0,
+      });
     }
     default:
-      return NextResponse.json(generateDailySummary());
+      return NextResponse.json(await generateDailySummary());
   }
 }

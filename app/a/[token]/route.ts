@@ -1,25 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
+import { supabaseAdmin } from '@/lib/supabase';
 
-export async function GET(_request: NextRequest, { params }: { params: { token: string } }) {
-  const db = getDb();
-  const table = db.prepare('SELECT id, table_number FROM tables WHERE qr_token = ? AND is_active = 1').get(params.token) as any;
+export async function GET(_request: NextRequest, { params }: { params: Promise<{ token: string }> }) {
+  const { token } = await params;
+  const { data: table } = await supabaseAdmin
+    .from('tables')
+    .select('id, table_number')
+    .eq('qr_token', token)
+    .eq('is_active', 1)
+    .maybeSingle();
 
   if (!table) {
     return NextResponse.redirect(new URL('/', _request.url));
   }
 
-  db.prepare('INSERT INTO qr_scans (table_id, qr_token, ip_address) VALUES (?, ?, ?)').run(
-    table.id, params.token, _request.headers.get('x-forwarded-for') || _request.headers.get('x-real-ip') || 'unknown'
-  );
+  await supabaseAdmin.from('qr_scans').insert({
+    table_id: table.id, qr_token: token,
+    ip_address: _request.headers.get('x-forwarded-for') || _request.headers.get('x-real-ip') || 'unknown',
+  });
 
-  const response = NextResponse.redirect(new URL(`/menu/${params.token}`, _request.url));
-  response.cookies.set('qr_session', params.token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 60 * 60 * 4,
-    path: '/',
+  const response = NextResponse.redirect(new URL(`/menu/${token}`, _request.url));
+  response.cookies.set('qr_session', token, {
+    httpOnly: true, secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict', maxAge: 60 * 60 * 4, path: '/',
   });
 
   return response;

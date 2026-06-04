@@ -2,27 +2,34 @@
 
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { io, Socket } from 'socket.io-client';
+import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { getCached, setCache } from '@/lib/cache';
 import { Download, Trash2, Plus } from 'lucide-react';
 import toast from 'react-hot-toast';
+
+const CACHE_KEY = 'tables';
 
 export default function TablesPanel() {
   const [tables, setTables] = useState<any[]>([]);
   const [newNum, setNewNum] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const loadTables = () => { fetch('/api/tables').then((r) => r.json()).then((d) => { setTables(d); setLoading(false); setCache(CACHE_KEY, d); }); };
+
   useEffect(() => {
+    const cached = getCached<any[]>(CACHE_KEY);
+    if (cached) { setTables(cached); setLoading(false); return; }
     loadTables();
-    const s: Socket = io();
-    s.emit('join-role', 'admin');
-    s.on('tables-changed', () => { loadTables(); });
-    return () => { s.disconnect(); };
+    const channel = supabase
+      .channel('admin-tables')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'tables' }, () => { loadTables(); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
   }, []);
-  const loadTables = () => { fetch('/api/tables').then((r) => r.json()).then((d) => { setTables(d); setLoading(false); }); };
 
   const addTable = async () => {
     if (!newNum) return;

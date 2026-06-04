@@ -3,8 +3,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
-import { io, Socket } from 'socket.io-client';
+import { supabase } from '@/lib/supabase';
 import { ShoppingBag, Plus, Minus, X, Search, Clock, Star, ChevronDown, Check, Loader2, ChefHat, UtensilsCrossed, CircleDollarSign } from 'lucide-react';
+
+function parseItems(items: any): any[] {
+  if (!items) return [];
+  if (Array.isArray(items)) return items;
+  try { return JSON.parse(items); } catch { return []; }
+}
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -18,7 +24,7 @@ interface MenuItem {
 
 interface CartItem {
   menu_item_id: number; name: string; price: number;
-  quantity: number; special_request: string;
+  quantity: number; special_request: string; image_url?: string | null;
 }
 
 interface Order {
@@ -50,9 +56,12 @@ export default function GuestMenu() {
   const [orderPlaced, setOrderPlaced] = useState(false);
   const [trackingOrder, setTrackingOrder] = useState(false);
   const [trackedOrder, setTrackedOrder] = useState<Order | null>(null);
+  const [trackedOrders, setTrackedOrders] = useState<Order[]>([]);
+  const [activeOrderIndex, setActiveOrderIndex] = useState(0);
   const [orderNumber, setOrderNumber] = useState('');
   const [orderAmount, setOrderAmount] = useState(0);
   const [orderId, setOrderId] = useState<number | null>(null);
+  const [ordering, setOrdering] = useState(false);
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(true);
   const [tableInfo, setTableInfo] = useState<any>(null);
@@ -61,7 +70,6 @@ export default function GuestMenu() {
   const [addedItemId, setAddedItemId] = useState<number | null>(null);
   const categoryNavRef = useRef<HTMLDivElement>(null);
   const categorySectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
-  const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
     const link = document.createElement('link');
@@ -85,19 +93,6 @@ export default function GuestMenu() {
     });
   }, [token]);
 
-  const connectSocket = useCallback((oid: number) => {
-    const s = io();
-    s.emit('join-order', oid);
-    s.on('order-updated', (updated: Order) => {
-      setTrackedOrder(updated);
-      if (updated.status === 'paid' || updated.status === 'cancelled') {
-        setTimeout(() => stopTracking(), 3000);
-      }
-    });
-    socketRef.current = s;
-    return s;
-  }, []);
-
   const categories = ['All', ...new Set(menuItems.map((i) => i.category))];
 
   const filtered = menuItems.filter((i) => {
@@ -110,7 +105,7 @@ export default function GuestMenu() {
     setCart((prev) => {
       const existing = prev.find((c) => c.menu_item_id === item.id);
       if (existing) return prev.map((c) => c.menu_item_id === item.id ? { ...c, quantity: c.quantity + 1 } : c);
-      return [...prev, { menu_item_id: item.id, name: item.name, price: item.price, quantity: 1, special_request: '' }];
+      return [...prev, { menu_item_id: item.id, name: item.name, price: item.price, quantity: 1, special_request: '', image_url: item.image_url }];
     });
     setAddedItemId(item.id);
     setTimeout(() => setAddedItemId(null), 600);
@@ -139,6 +134,8 @@ export default function GuestMenu() {
   };
 
   const placeOrder = async () => {
+    if (ordering || cart.length === 0) return;
+    setOrdering(true);
     const items = cart.map(({ menu_item_id, quantity, special_request, price }) => ({
       menu_item_id, quantity, special_request, unit_price: price,
     }));
@@ -148,55 +145,115 @@ export default function GuestMenu() {
       body: JSON.stringify({ table_id: tableInfo?.id, items, notes: notes || null }),
     });
     const order = await res.json();
+    const prevId = orderId;
+    const prevNumber = orderNumber;
+    const prevAmount = orderAmount;
     setOrderNumber(order.order_number);
     setOrderAmount(order.total_amount);
+    if (prevId) {
+      setTrackedOrders(prev => {
+        const updated = prev.some(o => o.id === prevId) ? prev : [...prev, { id: prevId, order_number: prevNumber, status: 'pending', total_amount: prevAmount, items: '[]', notes: null, created_at: new Date().toISOString() }];
+        saveTrackedOrders(updated);
+        return updated;
+      });
+    }
     setOrderId(order.id);
     setOrderPlaced(true);
     setCart([]);
     setNotes('');
     setShowCart(false);
+    setOrdering(false);
+  };
+
+  const saveTrackedOrders = (orders: Order[]) => {
+    localStorage.setItem('qrtrack', JSON.stringify({ token, orders: orders.map(o => ({ id: o.id, order_number: o.order_number, total_amount: o.total_amount })) }));
   };
 
   const startTracking = () => {
     if (!orderId) return;
-    const trackingData = { orderId, orderNumber, orderAmount, token };
-    localStorage.setItem('qrtrack', JSON.stringify(trackingData));
     setOrderPlaced(false);
     setTrackingOrder(true);
-    setTrackedOrder({ id: orderId, order_number: orderNumber, status: 'pending', total_amount: orderAmount, items: '[]', notes: null, created_at: new Date().toISOString() });
-    connectSocket(orderId);
+    const newOrder: Order = { id: orderId, order_number: orderNumber, status: 'pending', total_amount: orderAmount, items: '[]', notes: null, created_at: new Date().toISOString() };
+    setTrackedOrder(newOrder);
+    setTrackedOrders(prev => {
+      const exists = prev.some(o => o.id === orderId);
+      const updated = exists ? prev : [...prev, newOrder];
+      saveTrackedOrders(updated);
+      setActiveOrderIndex(updated.length - 1);
+      return updated;
+    });
   };
 
   const stopTracking = () => {
     localStorage.removeItem('qrtrack');
     setTrackingOrder(false);
     setTrackedOrder(null);
+    setTrackedOrders([]);
     setOrderId(null);
-    socketRef.current?.disconnect();
+    setActiveOrderIndex(0);
   };
+
+  const switchToOrder = (idx: number) => {
+    setActiveOrderIndex(idx);
+    const order = trackedOrders[idx];
+    if (order) {
+      setTrackedOrder(order);
+      setOrderId(order.id);
+      setOrderNumber(order.order_number);
+      setOrderAmount(order.total_amount);
+    }
+  };
+
+  const refreshTrackedOrder = useCallback(async (oid: number) => {
+    const res = await fetch(`/api/orders/${oid}`);
+    if (res.ok) {
+      const data = await res.json();
+      setTrackedOrders(prev => {
+        const updated = prev.map(o => o.id === oid ? data : o);
+        saveTrackedOrders(updated);
+        const allDone = updated.every(o => o.status === 'paid' || o.status === 'cancelled');
+        if (allDone) setTimeout(() => stopTracking(), 3000);
+        return updated;
+      });
+      setTrackedOrder(prev => prev?.id === oid ? data : prev);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (trackedOrders.length === 0) return;
+    const channels = trackedOrders.map(o =>
+      supabase
+        .channel(`order-${o.id}`)
+        .on('postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${o.id}` },
+          () => { refreshTrackedOrder(o.id); }
+        )
+        .subscribe()
+    );
+    return () => { channels.forEach(c => supabase.removeChannel(c)); };
+  }, [trackedOrders.length, refreshTrackedOrder]);
 
   useEffect(() => {
     const saved = localStorage.getItem('qrtrack');
     if (saved) {
       try {
         const data = JSON.parse(saved);
-        if (data.token === token) {
-          setOrderId(data.orderId);
-          setOrderNumber(data.orderNumber);
-          setOrderAmount(data.orderAmount);
+        if (data.token === token && data.orders?.length > 0) {
+          const restored = data.orders.map((o: any) => ({ ...o, items: '[]', notes: null, created_at: new Date().toISOString(), status: 'pending' }));
+          setTrackedOrders(restored);
+          setActiveOrderIndex(restored.length - 1);
+          setOrderId(restored[restored.length - 1].id);
+          setOrderNumber(restored[restored.length - 1].order_number);
+          setOrderAmount(restored[restored.length - 1].total_amount);
           setTrackingOrder(true);
-          setTrackedOrder({ id: data.orderId, order_number: data.orderNumber, status: 'pending', total_amount: data.orderAmount, items: '[]', notes: null, created_at: new Date().toISOString() });
-          connectSocket(data.orderId);
+          setTrackedOrder(restored[restored.length - 1]);
+          restored.forEach((o: any) => refreshTrackedOrder(o.id));
         } else {
           localStorage.removeItem('qrtrack');
         }
       } catch { localStorage.removeItem('qrtrack'); }
     }
-  }, [token, connectSocket]);
-
-  useEffect(() => {
-    return () => { socketRef.current?.disconnect(); };
-  }, []);
+  }, [token, refreshTrackedOrder]);
 
   if (loading) return (
     <div className="min-h-screen bg-stone-50">
@@ -232,12 +289,11 @@ export default function GuestMenu() {
     const stepIdx = getStepIndex(trackedOrder.status);
     const isCancelled = trackedOrder.status === 'cancelled';
     const isPaid = trackedOrder.status === 'paid';
-    const items = JSON.parse(trackedOrder.items || '[]');
+    const items = parseItems(trackedOrder.items);
 
     return (
       <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100 p-5">
         <div className="max-w-sm mx-auto pt-8">
-          {/* Header */}
           <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="text-center mb-8">
             <div className={`w-20 h-20 mx-auto mb-4 rounded-full flex items-center justify-center shadow-xl ${
               isCancelled ? 'bg-red-500 shadow-red-500/30' : isPaid ? 'bg-emerald-500 shadow-emerald-500/30' : 'bg-gradient-to-br from-amber-400 to-orange-500 shadow-amber-500/30'
@@ -252,8 +308,6 @@ export default function GuestMenu() {
             <p className="font-mono text-amber-600 font-bold">{trackedOrder.order_number}</p>
             <p className="text-gray-500 text-sm">Table {tableInfo?.table_number}</p>
           </motion.div>
-
-          {/* Progress Steps */}
           {!isCancelled && (
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}
               className="bg-white rounded-3xl shadow-xl p-6 mb-4">
@@ -264,7 +318,6 @@ export default function GuestMenu() {
                   const Icon = step.icon;
                   return (
                     <div key={step.key} className="flex items-start gap-4">
-                      {/* Line + Circle */}
                       <div className="flex flex-col items-center">
                         <motion.div initial={false} animate={{
                           scale: isActive ? 1.1 : 1,
@@ -282,7 +335,6 @@ export default function GuestMenu() {
                           <div className={`w-0.5 h-8 ${isComplete ? 'bg-amber-400' : 'bg-gray-200'}`} />
                         )}
                       </div>
-                      {/* Label */}
                       <div className="pt-2">
                         <p className={`text-sm font-semibold ${isActive ? 'text-amber-600' : isComplete ? 'text-gray-900' : 'text-gray-400'}`}>
                           {step.label}
@@ -304,8 +356,6 @@ export default function GuestMenu() {
               </div>
             </motion.div>
           )}
-
-          {/* Order Items */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}
             className="bg-white rounded-3xl shadow-xl p-6 mb-4">
             <h3 className="font-bold text-gray-900 mb-3">Order Details</h3>
@@ -322,11 +372,31 @@ export default function GuestMenu() {
               </div>
             </div>
           </motion.div>
-
-          {/* Actions */}
+          {trackedOrders.length > 1 && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+              className="bg-white rounded-3xl shadow-xl p-4 mb-4 flex items-center gap-2 overflow-x-auto">
+              <span className="text-xs text-gray-400 font-medium whitespace-nowrap">Your orders:</span>
+              {trackedOrders.map((o, idx) => (
+                <button key={o.id} onClick={() => switchToOrder(idx)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-all ${
+                    trackedOrder.id === o.id
+                      ? 'bg-amber-500 text-white shadow'
+                      : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                  }`}>
+                  #{o.order_number?.slice(-4)}
+                </button>
+              ))}
+            </motion.div>
+          )}
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="space-y-3">
+            {!isPaid && !isCancelled && (
+              <Button onClick={() => setTrackingOrder(false)}
+                size="lg" className="w-full bg-white border-2 border-amber-400 text-amber-600 hover:bg-amber-50 font-bold rounded-2xl h-14 shadow-lg">
+                + Add More Items
+              </Button>
+            )}
             {(isPaid || isCancelled) && (
-              <Button onClick={stopTracking}
+              <Button onClick={() => { stopTracking(); }}
                 size="lg" className="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-2xl h-14 shadow-lg shadow-amber-500/30">
                 Order Again
               </Button>
@@ -377,7 +447,6 @@ export default function GuestMenu() {
 
   return (
     <div className="min-h-screen bg-stone-50">
-      {/* Hero Banner — LCP image with fetchpriority="high" */}
       <div className="relative h-56 bg-gradient-to-br from-amber-600 via-orange-500 to-amber-700 overflow-hidden">
         <img
           src="https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=400&h=250&fit=crop&q=75&auto=format"
@@ -386,6 +455,8 @@ export default function GuestMenu() {
           fetchPriority="high"
           alt="Restaurant interior"
           className="absolute inset-0 w-full h-full object-cover opacity-20"
+          loading="lazy"
+          onError={(e) => { e.currentTarget.style.display = 'none'; }}
         />
         <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/20 to-transparent" />
         <div className="absolute bottom-0 left-0 right-0 p-5 pb-4">
@@ -398,8 +469,6 @@ export default function GuestMenu() {
           </div>
         </div>
       </div>
-
-      {/* Sticky Search & Categories */}
       <div className="sticky top-0 z-20 bg-white/95 backdrop-blur-xl border-b border-stone-100 shadow-sm" ref={categoryNavRef}>
         <div className="max-w-lg mx-auto px-5 pt-3 pb-2">
           <div className={`relative mb-3 transition-all duration-200 ${searchFocused ? 'scale-[1.02]' : ''}`}>
@@ -414,7 +483,6 @@ export default function GuestMenu() {
               </button>
             )}
           </div>
-
           <div className="flex gap-2 overflow-x-auto scrollbar-hide -mx-5 px-5 pb-2">
             {categories.map((cat) => {
               const isActive = activeCategory === cat;
@@ -433,14 +501,11 @@ export default function GuestMenu() {
           </div>
         </div>
       </div>
-
-      {/* Menu Content */}
       <div className="max-w-lg mx-auto px-5 pt-4 pb-32">
         {searchQuery && (
           <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }}
             className="text-sm text-stone-400 mb-4">{filtered.length} result{filtered.length !== 1 ? 's' : ''} for &quot;{searchQuery}&quot;</motion.p>
         )}
-
         {categories.filter(c => c !== 'All').map((cat) => {
           const catItems = filtered.filter((i) => i.category === cat);
           if (catItems.length === 0) return null;
@@ -455,7 +520,6 @@ export default function GuestMenu() {
                   <p className="text-xs text-stone-400">{catItems.length} item{catItems.length !== 1 ? 's' : ''}</p>
                 </div>
               </div>
-
               <div className="space-y-4">
                 {catItems.map((item, idx) => {
                   const cartItem = cart.find((c) => c.menu_item_id === item.id);
@@ -467,20 +531,19 @@ export default function GuestMenu() {
                       animate={{ opacity: 1, y: 0 }}
                       transition={{ delay: idx * 0.05, duration: 0.3 }}
                       className="bg-white rounded-3xl overflow-hidden shadow-sm hover:shadow-xl transition-all duration-500 border border-stone-100 group">
-                      {/* Food Image — first visible item gets fetchPriority high */}
-                      <div className="relative h-48 overflow-hidden">
+                      <div className="relative h-48 overflow-hidden bg-gradient-to-br from-amber-100 to-orange-200">
                         <img
-                          src={getFoodImageSrc(item.name, 'w600')}
-                          srcSet={getFoodImageSrcSet(item.name)}
+                          src={item.image_url || getFoodImageSrc(item.name, 'w600')}
+                          srcSet={item.image_url ? undefined : getFoodImageSrcSet(item.name)}
                           sizes="(max-width: 640px) 100vw, 600px"
                           alt={item.name}
                           className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 ease-out"
                           fetchPriority={isFirstVisibleItem ? 'high' : 'auto'}
                           loading={isFirstVisibleItem ? 'eager' : 'lazy'}
                           decoding="async"
+                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
                         />
                         <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent" />
-
                         <div className="absolute top-3 left-3 flex gap-2">
                           {item.is_recommended === 1 && (
                             <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }}>
@@ -490,13 +553,11 @@ export default function GuestMenu() {
                             </motion.div>
                           )}
                         </div>
-
                         <div className="absolute bottom-3 right-3">
                           <div className="bg-white/95 backdrop-blur-sm rounded-xl px-3 py-1.5 shadow-lg">
                             <span className="text-lg font-bold text-amber-600">ETB {item.price.toLocaleString()}</span>
                           </div>
                         </div>
-
                         {item.preparation_time > 0 && (
                           <div className="absolute bottom-3 left-3">
                             <div className="bg-black/60 backdrop-blur-sm rounded-lg px-2.5 py-1 flex items-center gap-1">
@@ -506,7 +567,6 @@ export default function GuestMenu() {
                           </div>
                         )}
                       </div>
-
                       <div className="p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
@@ -514,7 +574,6 @@ export default function GuestMenu() {
                             <p className="text-sm text-stone-500 line-clamp-2 leading-relaxed">{item.description}</p>
                           </div>
                         </div>
-
                         <div className="mt-3 flex items-center justify-between">
                           <div className="flex items-center gap-1">
                             {[1,2,3,4,5].map((s) => (
@@ -522,7 +581,6 @@ export default function GuestMenu() {
                             ))}
                             <span className="text-xs text-stone-400 ml-1">4.{8 - (item.id % 3)}</span>
                           </div>
-
                           {cartItem ? (
                             <motion.div initial={{ scale: 0.8 }} animate={{ scale: 1 }}
                               className="flex items-center gap-0 bg-stone-900 rounded-xl overflow-hidden shadow-lg">
@@ -562,7 +620,6 @@ export default function GuestMenu() {
             </div>
           );
         })}
-
         {filtered.length === 0 && (
           <div className="text-center py-20">
             <div className="w-20 h-20 mx-auto mb-4 bg-stone-100 rounded-full flex items-center justify-center">
@@ -573,8 +630,6 @@ export default function GuestMenu() {
           </div>
         )}
       </div>
-
-      {/* Floating Cart Button */}
       <AnimatePresence>
         {totalItems > 0 && !showCart && (
           <motion.div
@@ -605,8 +660,6 @@ export default function GuestMenu() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Cart Drawer */}
       <AnimatePresence>
         {showCart && (
           <motion.div className="fixed inset-0 z-50">
@@ -618,11 +671,9 @@ export default function GuestMenu() {
               exit={{ y: '100%' }}
               transition={{ type: 'spring', damping: 28, stiffness: 250 }}
               className="absolute bottom-0 left-0 right-0 max-h-[85vh] bg-white rounded-t-[2rem] shadow-2xl flex flex-col overflow-hidden">
-
               <div className="flex justify-center pt-3 pb-1">
                 <div className="w-10 h-1 bg-stone-200 rounded-full" />
               </div>
-
               <div className="flex items-center justify-between px-6 py-3 border-b border-stone-100">
                 <div>
                   <h2 className="text-xl font-bold text-gray-900">Your Order</h2>
@@ -632,7 +683,6 @@ export default function GuestMenu() {
                   <X className="h-5 w-5 text-stone-500" />
                 </button>
               </div>
-
               <div className="flex-1 overflow-y-auto px-6 py-4">
                 {cart.length === 0 ? (
                   <div className="text-center py-16">
@@ -647,13 +697,16 @@ export default function GuestMenu() {
                     {cart.map((item) => (
                       <motion.div key={item.menu_item_id} layout
                         className="flex items-center gap-4 p-3 bg-stone-50 rounded-2xl">
-                        <img
-                          src={getFoodImageSrc(item.name, 'w400')}
-                          alt={item.name}
-                          className="w-16 h-16 rounded-xl object-cover shadow-sm"
-                          loading="lazy"
-                          decoding="async"
-                        />
+                        <div className="relative w-16 h-16 rounded-xl overflow-hidden bg-gradient-to-br from-amber-100 to-orange-200 shrink-0">
+                          <img
+                            src={item.image_url || getFoodImageSrc(item.name, 'w400')}
+                            alt={item.name}
+                            className="w-full h-full object-cover shadow-sm"
+                            loading="lazy"
+                            decoding="async"
+                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                          />
+                        </div>
                         <div className="flex-1 min-w-0">
                           <h3 className="font-semibold text-gray-900 text-sm truncate">{item.name}</h3>
                           <p className="text-xs text-stone-400">ETB {item.price.toLocaleString()}</p>
@@ -672,7 +725,6 @@ export default function GuestMenu() {
                         <span className="font-bold text-sm text-stone-900 w-16 text-right">ETB {(item.price * item.quantity).toLocaleString()}</span>
                       </motion.div>
                     ))}
-
                     <div className="pt-2">
                       <textarea placeholder="Any special requests?" value={notes} onChange={(e) => setNotes(e.target.value)}
                         className="w-full p-3.5 bg-stone-50 rounded-2xl text-sm resize-none border-0 focus:ring-2 focus:ring-amber-500/20 outline-none placeholder:text-stone-400" rows={2} />
@@ -680,7 +732,6 @@ export default function GuestMenu() {
                   </div>
                 )}
               </div>
-
               {cart.length > 0 && (
                 <div className="border-t border-stone-100 px-6 py-5 space-y-4 bg-white">
                   <div className="space-y-2">
@@ -697,9 +748,9 @@ export default function GuestMenu() {
                       <span className="text-xl font-bold text-amber-600">ETB {totalAmount.toLocaleString()}</span>
                     </div>
                   </div>
-                  <motion.button whileTap={{ scale: 0.97 }} onClick={placeOrder}
-                    className="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-2xl py-4 text-base shadow-xl shadow-amber-500/30 transition-all">
-                    Place Order — ETB {totalAmount.toLocaleString()}
+                  <motion.button whileTap={{ scale: 0.97 }} onClick={placeOrder} disabled={ordering}
+                    className="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-bold rounded-2xl py-4 text-base shadow-xl shadow-amber-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                    {ordering ? 'Placing order...' : `Place Order — ETB ${totalAmount.toLocaleString()}`}
                   </motion.button>
                   <p className="text-xs text-stone-400 text-center">Cash payment at table</p>
                 </div>

@@ -1,29 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb } from '@/lib/db';
-import { emitMenuChanged } from '@/lib/socket';
+import { supabaseAdmin } from '@/lib/supabase';
 
 export async function GET(request: NextRequest) {
-  const db = getDb();
   const { searchParams } = new URL(request.url);
   const all = searchParams.get('all');
 
-  let query = 'SELECT * FROM menu_items';
-  if (all !== 'true') query += ' WHERE is_available = 1';
-  query += ' ORDER BY category, name';
+  let query = supabaseAdmin.from('menu_items').select('*');
+  if (all !== 'true') query = query.eq('is_available', 1);
+  query = query.order('category').order('name');
 
-  const items = db.prepare(query).all();
+  const { data: items } = await query;
   return NextResponse.json(items);
 }
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const db = getDb();
   const { name, price, cost, category, sub_category, description, image_url, is_available, is_recommended, preparation_time } = body;
-  const result = db.prepare(`
-    INSERT INTO menu_items (name, price, cost, category, sub_category, description, image_url, is_available, is_recommended, preparation_time)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(name, price, cost || 0, category, sub_category || null, description || null, image_url || null, is_available ?? 1, is_recommended ?? 0, preparation_time || 10);
-  const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(result.lastInsertRowid);
-  emitMenuChanged();
+
+  const { data: item } = await supabaseAdmin.from('menu_items').insert({
+    name, price, cost: cost || 0, category, sub_category: sub_category || null,
+    description: description || null, image_url: image_url || null,
+    is_available: is_available ?? 1, is_recommended: is_recommended ?? 0,
+    preparation_time: preparation_time || 10,
+  }).select().single();
+
   return NextResponse.json(item, { status: 201 });
 }

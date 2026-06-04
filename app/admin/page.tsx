@@ -203,14 +203,14 @@ export default function AdminPage() {
               className="text-gray-400 hover:text-white hover:bg-white/10">
               <KeyRound className="h-4 w-4 mr-1" /> PIN
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => { fetch('/api/staff/logout', { method: 'POST' }).catch(() => {}); setLoggedIn(false); setAdmin(null); setPin(''); localStorage.removeItem('admin_session'); }}
+            <Button variant="ghost" size="sm" onClick={() => { setLoggedIn(false); setAdmin(null); setPin(''); localStorage.removeItem('admin_session'); }}
               className="text-gray-400 hover:text-white hover:bg-white/10 ml-2">
               <LogOut className="h-4 w-4 mr-1" /> Logout
             </Button>
           </div>
 
           {/* Right: mobile logout */}
-          <button onClick={() => { fetch('/api/staff/logout', { method: 'POST' }).catch(() => {}); setLoggedIn(false); setAdmin(null); setPin(''); localStorage.removeItem('admin_session'); }}
+          <button onClick={() => { setLoggedIn(false); setAdmin(null); setPin(''); localStorage.removeItem('admin_session'); }}
             className="lg:hidden p-2 hover:bg-white/10 rounded-xl transition text-gray-400 hover:text-white">
             <LogOut className="h-5 w-5" />
           </button>

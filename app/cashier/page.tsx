@@ -117,7 +117,6 @@ export default function CashierPage() {
   };
 
   const handleLogout = async () => {
-    await fetch('/api/staff/logout', { method: 'POST' }).catch(() => {});
     if (sessionId) await fetch('/api/sessions', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: sessionId, ending_cash: 0 }) }).catch(() => {});
     setLoggedIn(false); setCashier(null); setSessionId(null); setPin(''); setOrders([]);
     localStorage.removeItem('cashier_session');
